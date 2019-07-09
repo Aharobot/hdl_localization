@@ -7,6 +7,7 @@
 #include <pcl_ros/point_cloud.h>
 #include <tf_conversions/tf_eigen.h>
 #include <tf/transform_broadcaster.h>
+#include <tf/transform_listener.h>
 
 #include <nav_msgs/Odometry.h>
 #include <sensor_msgs/Imu.h>
@@ -45,16 +46,24 @@ public:
 
     use_imu = private_nh.param<bool>("use_imu", true);
     invert_imu = private_nh.param<bool>("invert_imu", false);
+
+    //init rostopic name
+    std::string imu_topic = private_nh.param<std::string>("imu_topic", "/imu");
+    std::string lidar_topic = private_nh.param<std::string>("lidar_topic", "/rslidar_points");
+    lidar_frameid = private_nh.param<std::string>("lidar_frameid", "rslidar");
+
     if(use_imu) {
-      NODELET_INFO("enable imu-based prediction");
-      imu_sub = mt_nh.subscribe("/gpsimu_driver/imu_data", 256, &HdlLocalizationNodelet::imu_callback, this);
+        NODELET_INFO("enable imu-based prediction");
+        imu_sub = mt_nh.subscribe(imu_topic, 256, &HdlLocalizationNodelet::imu_callback, this);
     }
-    points_sub = mt_nh.subscribe("/velodyne_points", 5, &HdlLocalizationNodelet::points_callback, this);
+    points_sub = mt_nh.subscribe(lidar_topic, 5, &HdlLocalizationNodelet::points_callback, this);
+
     globalmap_sub = nh.subscribe("/globalmap", 1, &HdlLocalizationNodelet::globalmap_callback, this);
     initialpose_sub = nh.subscribe("/initialpose", 8, &HdlLocalizationNodelet::initialpose_callback, this);
 
     pose_pub = nh.advertise<nav_msgs::Odometry>("/odom", 5, false);
     aligned_pub = nh.advertise<sensor_msgs::PointCloud2>("/aligned_points", 5, false);
+    transform_OK = false;
   }
 
 private:
@@ -229,21 +238,40 @@ private:
    * @param pose   odometry pose to be published
    */
   void publish_odometry(const ros::Time& stamp, const Eigen::Matrix4f& pose) {
+
+    if(!transform_OK)
+    {
+        // 先获得base_link到velodyne的tf转换关系，以便发布map到base_link的tf
+        if(tf_listener.waitForTransform("/base_link", lidar_frameid, ros::Time(0), ros::Duration(1.0)))
+        {
+            tf_listener.lookupTransform("/base_link", lidar_frameid, ros::Time(0), tf_base2velodyne);
+            transform_OK = true;
+        }
+        else{
+            NODELET_ERROR("fail to get transform, wait for the tf");
+            return;
+        }
+    }
+
     // broadcast the transform over tf
-    geometry_msgs::TransformStamped odom_trans = matrix2transform(stamp, pose, "map", "velodyne");
+    geometry_msgs::TransformStamped odom_trans = matrix2transform(stamp, pose, "map", "base_link");
+    //geometry_msgs::TransformStamped odom_trans = matrix2transform(stamp, pose, "map", "velodyne");
+
+    //ROS_INFO("%f   %f", odom_trans.transform.translation.x, odom_trans.transform.translation.y );
     pose_broadcaster.sendTransform(odom_trans);
 
     // publish the transform
     nav_msgs::Odometry odom;
     odom.header.stamp = stamp;
-    odom.header.frame_id = "map";
+    odom.header.frame_id = "odom";
 
     odom.pose.pose.position.x = pose(0, 3);
     odom.pose.pose.position.y = pose(1, 3);
     odom.pose.pose.position.z = pose(2, 3);
     odom.pose.pose.orientation = odom_trans.transform.rotation;
 
-    odom.child_frame_id = "velodyne";
+    //odom.child_frame_id = "velodyne";
+    odom.child_frame_id = "base_link";
     odom.twist.twist.linear.x = 0.0;
     odom.twist.twist.linear.y = 0.0;
     odom.twist.twist.angular.z = 0.0;
@@ -260,6 +288,7 @@ private:
    * @return transform
    */
   geometry_msgs::TransformStamped matrix2transform(const ros::Time& stamp, const Eigen::Matrix4f& pose, const std::string& frame_id, const std::string& child_frame_id) {
+#if 0
     Eigen::Quaternionf quat(pose.block<3, 3>(0, 0));
     quat.normalize();
     geometry_msgs::Quaternion odom_quat;
@@ -277,6 +306,32 @@ private:
     odom_trans.transform.translation.y = pose(1, 3);
     odom_trans.transform.translation.z = pose(2, 3);
     odom_trans.transform.rotation = odom_quat;
+#else
+    //Eigen::Quaternionf eigen_quat(pose.block<3,3>(0,0).cast<float>());
+    //Eigen::Vector3f eigen_trans(pose.block<3,1>(0,3).cast<float>());
+    Eigen::Quaternionf eigen_quat(pose.block<3,3>(0,0));
+    Eigen::Vector3f eigen_trans(pose.block<3,1>(0,3));
+
+    tf::Quaternion tf_quat(eigen_quat.x(), eigen_quat.y(), eigen_quat.z(), eigen_quat.w());
+    tf::Vector3 tf_trans(eigen_trans(0), eigen_trans(1), eigen_trans(2));
+    //ROS_INFO("pose(0,3):%f, pose(1,3):%f", pose(0,3), pose(1,3));
+
+    //计算map到velodyne的tf关系,current_timed对应于回调函数中激光雷达获取的时间，而不是当前时间。
+    current_time = ros::Time::now();
+    tf::StampedTransform tf_map2velodyne(tf::Transform(tf_quat, tf_trans), stamp, "map", lidar_frameid);
+
+    //计算map到base_link的tf关系。
+    tf::StampedTransform tf_map2base;
+    tf_map2base.mult(tf_map2velodyne, tf_base2velodyne.inverse());
+    tf_map2base.stamp_ = stamp;
+    tf_map2base.frame_id_ = frame_id;
+    tf_map2base.child_frame_id_ = child_frame_id;
+
+    geometry_msgs::TransformStamped odom_trans;
+    tf::transformStampedTFToMsg(tf_map2base, odom_trans);
+    //ROS_INFO("%f   %f", odom_trans.transform.translation.x, odom_trans.transform.translation.y );
+#endif
+
 
     return odom_trans;
   }
@@ -287,6 +342,7 @@ private:
   ros::NodeHandle mt_nh;
   ros::NodeHandle private_nh;
 
+  bool use_sync;
   bool use_imu;
   bool invert_imu;
   ros::Subscriber imu_sub;
@@ -313,6 +369,14 @@ private:
 
   // processing time buffer
   boost::circular_buffer<double> processing_time;
+
+  // 先获得base_link到velodyne的tf转换关系，以便发布map到base_link的tf
+  tf::StampedTransform tf_base2velodyne;
+  tf::TransformListener tf_listener;
+  ros::Time current_time;
+  std::string lidar_frameid;
+  bool transform_OK;
+
 };
 
 }

@@ -64,3 +64,16 @@ target_link_libraries(globalmap_server_nodelet
   ${PCL_LIBRARIES}
 )
 
+install (FILES nodelet_plugins.xml
+    DESTINATION ${CATKIN_PACKAGE_SHARE_DESTINATION})
+
+install(DIRECTORY launch/
+        DESTINATION ${CATKIN_PACKAGE_SHARE_DESTINATION}/launch)
+
+install(TARGETS hdl_localization_nodelet globalmap_server_nodelet
+  LIBRARY DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
+)
+
+install(DIRECTORY data/
+        DESTINATION ${CATKIN_PACKAGE_SHARE_DESTINATION}/data)
+
